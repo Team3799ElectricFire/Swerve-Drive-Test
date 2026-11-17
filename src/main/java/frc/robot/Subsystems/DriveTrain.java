@@ -1,0 +1,314 @@
+// Copyright (c) FIRST and other WPILib contributors.
+// Open Source Software; you can modify and/or share it under the terms of
+// the WPILib BSD license file in the root directory of this project.
+
+package frc.robot.Subsystems;
+
+import com.ctre.phoenix6.hardware.Pigeon2;
+import com.pathplanner.lib.auto.AutoBuilder;
+import com.pathplanner.lib.controllers.PPHolonomicDriveController;
+
+import edu.wpi.first.epilogue.Logged;
+import edu.wpi.first.math.MathUtil;
+import edu.wpi.first.math.Matrix;
+import edu.wpi.first.math.estimator.SwerveDrivePoseEstimator;
+import edu.wpi.first.math.geometry.Pose2d;
+import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.math.geometry.Translation2d;
+import edu.wpi.first.math.kinematics.ChassisSpeeds;
+import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
+import edu.wpi.first.math.kinematics.SwerveModulePosition;
+import edu.wpi.first.math.kinematics.SwerveModuleState;
+import edu.wpi.first.math.numbers.N1;
+import edu.wpi.first.math.numbers.N3;
+import edu.wpi.first.wpilibj.DriverStation;
+import edu.wpi.first.wpilibj.DriverStation.Alliance;
+import edu.wpi.first.wpilibj2.command.Command;
+import edu.wpi.first.wpilibj2.command.SubsystemBase;
+import frc.robot.Constants;
+import frc.robot.VisionConstants;
+import frc.robot.Utilities.SwerveModule;
+import frc.robot.Utilities.SwerveModule_SDS_Mk4i;
+
+public class DriveTrain extends SubsystemBase{
+  // Swerve modules
+  @Logged
+  private SwerveModule FrontRightModule = new SwerveModule_SDS_Mk4i(
+    Constants.FrontRightDriveMotorID,
+    Constants.FrontRightSteerMotorID,
+    Constants.kFrontRightChassisAngularOffset);
+  @Logged
+  private SwerveModule FrontLeftModule = new SwerveModule_SDS_Mk4i(
+    Constants.FrontLeftDriveMotorID,
+    Constants.FrontLeftSteerMotorID,
+    Constants.kFrontLeftChassisAngularOffset);
+  @Logged
+  private SwerveModule BackRightModule = new SwerveModule_SDS_Mk4i(
+    Constants.BackRightDriveMotorID,
+    Constants.BackRightSteerMotorID,
+    Constants.kBackRightChassisAngularOffset);
+  @Logged
+  private SwerveModule BackLeftModule = new SwerveModule_SDS_Mk4i(
+    Constants.BackLeftDriveMotorID,
+    Constants.BackLeftSteerMotorID,
+    Constants.kBackLeftChassisAngularOffset);
+  private static final double maxModuleAttainableSpeed = SwerveModule_SDS_Mk4i.getMaxAttainableSpeed(); // Minimum "max speed" of all module types used
+
+  // Gyro sensor
+  private Pigeon2 Pidgey = new Pigeon2(Constants.PidgeonID);
+  
+  // Pose Estimator for tracking robot pose
+  private SwerveDrivePoseEstimator poseEstimator = new SwerveDrivePoseEstimator(
+    Constants.kDriveKinematics, 
+    Pidgey.getRotation2d(), 
+    getModulePositions(),
+    new Pose2d(),
+    VisionConstants.kStateStdDevs,
+    VisionConstants.kVisionStdDevs
+  );
+
+  private Translation2d RotationCenter = new Translation2d();
+  
+  private Alliance OurAlliance = Alliance.Red;
+  @Logged 
+  private Rotation2d HubAngle = Rotation2d.kZero;
+  @Logged
+  private boolean FacingHub = false;
+  @Logged
+  private double HubDistance = 0.0;
+
+  /** Creates a new Drivetrain. */
+  public DriveTrain() {
+    // Autobuilder
+    AutoBuilder.configure(
+      this::getPose,
+      this::resetPose,
+      this::getRobotRelativeSpeeds,
+      this::driveRobotRelative,
+      new PPHolonomicDriveController( // PPHolonomicController is the built in path following controller for holonomic drive trains
+        Constants.TranslationPIDconstants,
+        Constants.RotationPIDconstants),
+      Constants.ROBOTCONFIG,
+      () -> {
+        // Boolean supplier that controls when the path will be mirrored for the red alliance
+        // This will flip the path being followed to the red side of the field.
+        // THE ORIGIN WILL REMAIN ON THE BLUE SIDE
+
+        var alliance = DriverStation.getAlliance();
+        if (alliance.isPresent()) {
+          return alliance.get() == DriverStation.Alliance.Red;
+        }
+        return false;
+      },
+      this);
+  }
+
+  @Override
+  public void periodic() {
+    // This method will be called once per scheduler run
+    
+    // Update pose estimator with info from gyro and swerve modules
+    poseEstimator.update(Pidgey.getRotation2d(), getModulePositions());
+
+    Translation2d hubCenter = (OurAlliance == Alliance.Blue) ? Constants.kBlueHub : Constants.kRedHub;
+    Translation2d robot2HubTranslation = hubCenter.minus(getPose().getTranslation());
+
+    // Flip HubAngle by 180deg to track back of robot facing hub
+    HubAngle = robot2HubTranslation.getAngle().rotateBy(Rotation2d.k180deg);
+    HubDistance = robot2HubTranslation.getNorm();
+    
+    FacingHub = MathUtil.isNear(
+      0.0,
+      HubAngle.minus(getPose().getRotation()).getDegrees(),
+      Constants.kFacingHubTolerance
+    );
+  }
+
+  public void setAlliance(Alliance color) {
+    OurAlliance = color;
+  }
+  public Rotation2d getHubAngle(){
+    return this.HubAngle; 
+  }
+  @Logged
+  public Pose2d getPose() {
+    return poseEstimator.getEstimatedPosition();
+  }
+  
+  public void resetPose(Pose2d pose) {
+    poseEstimator.resetPosition(
+        Pidgey.getRotation2d(),
+        getModulePositions(),
+        pose);
+  }
+  public Command resetPoseCommand(Pose2d pose) {
+    return this.runOnce(() -> {resetPose(pose);}).ignoringDisable(true);
+  }
+
+  public void addVisionMeasurement(Pose2d visionRobotPoseMeters,
+      double timestampSeconds,
+      Matrix<N3, N1> visionMeasurementStdDevs) {
+    poseEstimator.addVisionMeasurement(visionRobotPoseMeters, timestampSeconds, visionMeasurementStdDevs);
+  }
+
+  public void addVisionMeasurement(Pose2d visionRobotPoseMeters,
+      double timestampSeconds) {
+    poseEstimator.addVisionMeasurement(visionRobotPoseMeters, timestampSeconds);
+  }
+
+  @Logged
+  public ChassisSpeeds getRobotRelativeSpeeds() {
+    return Constants.kDriveKinematics.toChassisSpeeds(getModuleState());
+  }
+
+  public double getHubDistance(){
+    return HubDistance;
+  }
+
+  public boolean getFacingHub() {
+    return FacingHub;
+  }
+
+  public void driveRobotRelative(ChassisSpeeds speeds) {
+    SwerveModuleState[] moduleStates = Constants.kDriveKinematics.toSwerveModuleStates(speeds, RotationCenter);
+
+    // desaturateWheelSpeed() is changing the value of moduleStates, not returning a new variable
+    SwerveDriveKinematics.desaturateWheelSpeeds(moduleStates, maxModuleAttainableSpeed);
+
+    FrontRightModule.setDesiredState(moduleStates[0]);
+    FrontLeftModule.setDesiredState(moduleStates[1]);
+    BackRightModule.setDesiredState(moduleStates[2]);
+    BackLeftModule.setDesiredState(moduleStates[3]);
+  }
+
+  public void driveRobotRelative(double xSpeed, double ySpeed, double rot) {
+    double xVelocityMetersPerSecond = xSpeed * Constants.maxDriverCommandSpeed;
+    double yVelocityMetersPerSecond = ySpeed * Constants.maxDriverCommandSpeed;
+    double rotationRadiansPerSecond = rot * Constants.kMaxAngularSpeed;
+
+    ChassisSpeeds speeds = new ChassisSpeeds(xVelocityMetersPerSecond, yVelocityMetersPerSecond, rotationRadiansPerSecond);
+
+    SwerveModuleState[] moduleStates = Constants.kDriveKinematics.toSwerveModuleStates(speeds, RotationCenter);
+
+    // desaturateWheelSpeed() is changing the value of moduleStates, not returning a new variable
+    SwerveDriveKinematics.desaturateWheelSpeeds(moduleStates, Constants.maxDriverCommandSpeed); 
+
+    FrontRightModule.setDesiredState(moduleStates[0]);
+    FrontLeftModule.setDesiredState(moduleStates[1]);
+    BackRightModule.setDesiredState(moduleStates[2]);
+    BackLeftModule.setDesiredState(moduleStates[3]);
+  }
+
+  public void driveFieldRelative(double xSpeed, double ySpeed, double rot) {
+    double xVelocityMetersPerSecond = xSpeed * Constants.maxDriverCommandSpeed;
+    double yVelocityMetersPerSecond = ySpeed * Constants.maxDriverCommandSpeed;
+    double rotationRadiansPerSecond = rot * Constants.kMaxAngularSpeed;
+
+    ChassisSpeeds speeds = ChassisSpeeds.fromFieldRelativeSpeeds(xVelocityMetersPerSecond, yVelocityMetersPerSecond, rotationRadiansPerSecond, Pidgey.getRotation2d());
+
+    SwerveModuleState[] moduleStates = Constants.kDriveKinematics.toSwerveModuleStates(speeds, RotationCenter);
+
+    // desaturateWheelSpeed() is changing the value of moduleStates, not returning a new variable
+    SwerveDriveKinematics.desaturateWheelSpeeds(moduleStates,Constants.maxDriverCommandSpeed); 
+
+    FrontRightModule.setDesiredState(moduleStates[0]);
+    FrontLeftModule.setDesiredState(moduleStates[1]);
+    BackRightModule.setDesiredState(moduleStates[2]);
+    BackLeftModule.setDesiredState(moduleStates[3]);
+  }
+
+  public void setX() {
+    FrontRightModule.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(-45)));
+    FrontLeftModule.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(45)));
+    BackRightModule.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(45)));
+    BackLeftModule.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(-45)));
+  }
+
+  public void stop() {
+    FrontRightModule.stop();
+    FrontLeftModule.stop();
+    BackRightModule.stop();
+    BackLeftModule.stop();
+  }
+  @Logged
+  public SwerveModuleState[] getModuleState() {
+    SwerveModuleState[] states = new SwerveModuleState[4];
+    states[0] = FrontRightModule.getState();
+    states[1] = FrontLeftModule.getState();
+    states[2] = BackRightModule.getState();
+    states[3] = BackLeftModule.getState();
+
+    return states;
+  }
+
+  public SwerveModulePosition[] getModulePositions() {
+    return new SwerveModulePosition[] {
+        FrontRightModule.getPosition(),
+        FrontLeftModule.getPosition(),
+        BackRightModule.getPosition(),
+        BackLeftModule.getPosition()
+    };
+  }
+
+  public void setModuleStates(SwerveModuleState[] desiredStates) {
+    SwerveDriveKinematics.desaturateWheelSpeeds(desiredStates,Constants.maxDriverCommandSpeed);
+
+    FrontRightModule.setDesiredState(desiredStates[0]);
+    FrontLeftModule.setDesiredState(desiredStates[1]);
+    BackRightModule.setDesiredState(desiredStates[2]);
+    BackLeftModule.setDesiredState(desiredStates[3]);
+  }
+
+  public void setChassisSpeeds(ChassisSpeeds desiredSpeeds) {
+    SwerveModuleState[] moduleStates = Constants.kDriveKinematics.toSwerveModuleStates(desiredSpeeds, RotationCenter);
+
+    // desaturateWheelSpeed() is changing the value of moduleStates, not returning a new variable
+    SwerveDriveKinematics.desaturateWheelSpeeds(moduleStates, Constants.maxDriverCommandSpeed);
+    
+    FrontRightModule.setDesiredState(moduleStates[0]);
+    FrontLeftModule.setDesiredState(moduleStates[1]);
+    BackRightModule.setDesiredState(moduleStates[2]);
+    BackLeftModule.setDesiredState(moduleStates[3]);
+  }
+
+  public void setHeading(double newAngleDegrees) {
+    Pidgey.setYaw(newAngleDegrees);
+  }
+
+  public void zeroHeading() {
+    Pidgey.setYaw(0.0);
+  }
+
+  public Command ZeroHeadingCommand(){
+    return runOnce(() -> {
+      zeroHeading();
+    }).ignoringDisable(true);
+  }
+  
+  @Logged
+  public double getHeading() {
+    return Pidgey.getRotation2d().getRadians();
+  }
+
+  public double getPitch() {
+    return Pidgey.getPitch().getValueAsDouble();
+  }
+
+  public double getRoll() {
+    return Pidgey.getRoll().getValueAsDouble();
+  }
+
+  public void setRotationCenterGamePiece(Translation2d newCenter) {
+    RotationCenter = newCenter;
+  }
+
+  public void resetRotationCenterRobot() {
+    RotationCenter = new Translation2d();
+  }
+
+  public Command DriveBackwardCommand() {
+    return this.run(() -> {
+      driveFieldRelative(-0.5, 0.0, 0.0);
+    }).withTimeout(1.0);
+  }
+}
